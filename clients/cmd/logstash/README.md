@@ -1,6 +1,8 @@
-# Fork of Loki Logstash Output Plugin
+# Contributing to Loki Logstash Output Plugin
 
-Added features:
+For information about how to use this plugin see this [documentation](../../docs/sources/clients/logstash/_index.md).
+
+## Added features:
 
 * split batches by the tenant attribute. Use ‘default’ if attribute not set.
 * add  X-Scope-OrgID header based on ‘tenant' message field.
@@ -15,9 +17,7 @@ Available from <https://rubygems.org/gems/logstash-output-loki-tenants>
     - Rebuild the plugin
     - Push proper version
 
-## Contributing to Loki Logstash Output Plugin
 
-For information about how to use this plugin see this [documentation](../../docs/sources/clients/logstash/_index.md).
 
 ## Install dependencies
 
