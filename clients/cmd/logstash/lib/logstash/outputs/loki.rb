@@ -53,10 +53,9 @@ class LogStash::Outputs::Loki < LogStash::Outputs::Base
   ## 'Backoff configuration. Maximum number of retries to do'
   config :retries, :validate => :number, :default => 10, :required => false
 
-  attr_reader :batches
+  attr_reader :batch
   public
   def register
-
     @uri = URI.parse(@url)
     unless @uri.is_a?(URI::HTTP) || @uri.is_a?(URI::HTTPS)
       raise LogStash::ConfigurationError, "url parameter must be valid HTTP, currently '#{@url}'"
@@ -74,7 +73,7 @@ class LogStash::Outputs::Loki < LogStash::Outputs::Base
     @stop = false
 
     # create nil batch object.
-    @batches = Hash.new
+    @batch = nil
 
     # validate certs
     if ssl_cert?
@@ -85,14 +84,6 @@ class LogStash::Outputs::Loki < LogStash::Outputs::Base
     # start batch_max_wait and batch_max_size threads
     @batch_wait_thread = Thread.new{max_batch_wait()}
     @batch_size_thread = Thread.new{max_batch_size()}
-
-  end
-
-  def batch(tenant = 'default')
-    return nil if @batches.nil?
-    return @batches[tenant] if !tenant.nil? && !tenant.empty? && @batches.key?(tenant)
-    return @batches['default'] if @batches.key?('default')
-    return nil
   end
 
   def max_batch_size
@@ -104,15 +95,11 @@ class LogStash::Outputs::Loki < LogStash::Outputs::Base
       e = @entries.deq
       return if e.nil?
 
-      tenant = nil
-      tenant = e.labels['tenant'] if !e.labels.nil? && e.labels.key?('tenant')
-      tenant = 'default' if tenant.nil? or tenant.empty?
-
       @mutex.synchronize do
-        if !add_entry_to_batch(e, tenant)
-          @logger.debug("Max batch_size is reached. Sending batch to loki. Tenant #{tenant}")
-          send_batch_for_tenant(tenant)
-          @batches[tenant] = Batch.new(e)
+        if !add_entry_to_batch(e)
+          @logger.debug("Max batch_size is reached. Sending batch to loki")
+          send(@batch)
+          @batch = Batch.new(e)
         end
       end
     end
@@ -132,15 +119,12 @@ class LogStash::Outputs::Loki < LogStash::Outputs::Base
       end
 
       sleep(max_wait_checkfrequency)
-
-      @mutex.synchronize do
-        @batches.keys.clone.each { |tenant|
-          if is_batch_expired(tenant)
-            @logger.debug("Max batch_wait time is reached. Sending batch to loki. Tenant #{tenant}")
-            send_batch_for_tenant(tenant)
-            @batches.delete(tenant)
-          end
-        }
+      if is_batch_expired
+        @mutex.synchronize do
+          @logger.debug("Max batch_wait time is reached. Sending batch to loki")
+          send(@batch)
+          @batch = nil
+        end
       end
     end
   end
@@ -190,37 +174,25 @@ class LogStash::Outputs::Loki < LogStash::Outputs::Base
 
   # Add an entry to the current batch returns false if the batch is full
   # and the entry can't be added.
-  def add_entry_to_batch(e, tenant = 'default')
+  def add_entry_to_batch(e)
     line = e.entry['line']
     # we don't want to send empty lines.
     return true if line.to_s.strip.empty?
 
-    tenant = 'default' if tenant.nil? or tenant.empty?
-
-    if @batches.nil?
-      @batches = Hash.new
-    end
-
-    if !@batches.key?(tenant)
-      @batches[tenant] = Batch.new(e)
+    if @batch.nil?
+      @batch = Batch.new(e)
       return true
     end
 
-    if @batches[tenant].size_bytes_after(line) > @batch_size
+    if @batch.size_bytes_after(line) > @batch_size
       return false
     end
-
-    @batches[tenant].add(e)
+    @batch.add(e)
     return true
   end
 
-  def is_batch_expired(tenant = 'default')
-    tenant = 'default' if tenant.nil? or tenant.empty?
-    return !@batches.nil? && @batches.key?(tenant) && @batches[tenant].age() >= @batch_wait
-  end
-
-  def send_batch_for_tenant(tenant)
-    send(batch(tenant), tenant)
+  def is_batch_expired
+    return !@batch.nil? && @batch.age() >= @batch_wait
   end
 
   ## Receives logstash events
@@ -238,16 +210,13 @@ class LogStash::Outputs::Loki < LogStash::Outputs::Base
     @batch_size_thread.join
 
     # if by any chance we still have a forming batch, we need to send it.
-    @batches.keys.each { |tenant|
-      send_batch_for_tenant(tenant)
-    }
-    @batches.clear()
-    @batches = nil
+    send(@batch) if !@batch.nil?
+    @batch = nil
   end
 
-  def send(batch, tenant = 'default')
+  def send(batch)
     payload = batch.to_json
-    res = loki_http_request(payload, tenant)
+    res = loki_http_request(payload)
     if res.is_a?(Net::HTTPSuccess)
       @logger.debug("Successfully pushed data to loki")
     else
@@ -255,24 +224,19 @@ class LogStash::Outputs::Loki < LogStash::Outputs::Base
     end
   end
 
-  def loki_http_request(payload, tenant = 'default')
+  def loki_http_request(payload)
     req = Net::HTTP::Post.new(
       @uri.request_uri
     )
     req.add_field('Content-Type', 'application/json')
-    if !tenant.nil? && !tenant.empty? && !tenant.eql?('default')
-      req.add_field('X-Scope-OrgID', tenant)
-    elsif !@tenant_id.nil? && !@tenant_id.empty?
-      req.add_field('X-Scope-OrgID', @tenant_id)
-    end
-
+    req.add_field('X-Scope-OrgID', @tenant_id) if @tenant_id
     req['User-Agent']= 'loki-logstash'
     req.basic_auth(@username, @password) if @username
     req.body = payload
 
     opts = ssl_opts(@uri)
 
-    @logger.debug("sending #{req.body.length} bytes to loki. tenant #{tenant}")
+    @logger.debug("sending #{req.body.length} bytes to loki")
     retry_count = 0
     delay = @min_delay
     begin
